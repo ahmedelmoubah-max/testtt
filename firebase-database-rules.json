@@ -1,0 +1,103 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "users": {
+      ".read": "auth != null",
+      "$uid": {
+        ".write": "auth != null && auth.uid === $uid"
+      }
+    },
+    "staffUsers": {
+      "$uid": {
+        ".read": "auth != null && (auth.uid === $uid || root.child('deutschA1').child('admins').child(auth.uid).val() === true)",
+        ".write": false
+      }
+    },
+    "deutschA1": {
+      "admins": {
+        "$uid": {
+          ".read": "auth != null && auth.uid === $uid",
+          ".write": false
+        }
+      },
+      "users": {
+        ".read": "auth != null && root.child('deutschA1').child('admins').child(auth.uid).val() === true",
+        "$uid": {
+          ".read": "auth != null && (auth.uid === $uid || root.child('deutschA1').child('admins').child(auth.uid).val() === true)",
+          ".write": "auth != null && root.child('deutschA1').child('admins').child(auth.uid).val() === true"
+        }
+      },
+      "results": {
+        ".read": "auth != null && root.child('deutschA1').child('admins').child(auth.uid).val() === true",
+        "$uid": {
+          ".read": "auth != null && (auth.uid === $uid || root.child('deutschA1').child('admins').child(auth.uid).val() === true)",
+          ".write": "auth != null && (auth.uid === $uid || root.child('deutschA1').child('admins').child(auth.uid).val() === true)"
+        }
+      },
+      "activity": {
+        ".read": "auth != null && root.child('deutschA1').child('admins').child(auth.uid).val() === true",
+        "$uid": {
+          ".read": "auth != null && (auth.uid === $uid || root.child('deutschA1').child('admins').child(auth.uid).val() === true)",
+          ".write": "auth != null && auth.uid === $uid"
+        }
+      },
+      "groups": {
+        ".read": "auth != null",
+        "$groupId": {
+          ".write": "auth != null && root.child('deutschA1').child('admins').child(auth.uid).val() === true"
+        }
+      },
+      "vocabularyTests": {
+        ".read": "auth != null && root.child('deutschA1').child('admins').child(auth.uid).val() === true",
+        ".write": "auth != null && root.child('deutschA1').child('admins').child(auth.uid).val() === true"
+      },
+      "vocabularyTestContent": {
+        ".read": "auth != null && root.child('deutschA1').child('admins').child(auth.uid).val() === true",
+        ".write": "auth != null && root.child('deutschA1').child('admins').child(auth.uid).val() === true"
+      },
+      "competitions": {
+        "$roomId": {
+          ".read": "auth != null && data.child('members').child(auth.uid).exists()",
+          ".write": false
+        }
+      },
+      "competitionCodes": {
+        ".read": false,
+        ".write": false
+      },
+      "competitionAnswers": {
+        ".read": false,
+        ".write": false
+      },
+      "competitionStats": {
+        ".read": "auth != null",
+        ".write": false
+      },
+      "contentMeta": {
+        ".read": "auth != null",
+        ".write": "auth != null && root.child('deutschA1').child('admins').child(auth.uid).val() === true"
+      },
+      "contentFiles": {
+        ".read": "auth != null",
+        ".write": "auth != null && root.child('deutschA1').child('admins').child(auth.uid).val() === true"
+      },
+      "managedPages": {
+        ".read": "auth != null",
+        ".write": "auth != null && root.child('deutschA1').child('admins').child(auth.uid).val() === true"
+      },
+      "managedPageFiles": {
+        ".read": "auth != null",
+        ".write": "auth != null && root.child('deutschA1').child('admins').child(auth.uid).val() === true"
+      },
+      "managedPageDrafts": {
+        ".read": "auth != null && root.child('deutschA1').child('admins').child(auth.uid).val() === true",
+        ".write": "auth != null && root.child('deutschA1').child('admins').child(auth.uid).val() === true"
+      },
+      "managedPageVersions": {
+        ".read": "auth != null && root.child('deutschA1').child('admins').child(auth.uid).val() === true",
+        ".write": "auth != null && root.child('deutschA1').child('admins').child(auth.uid).val() === true"
+      }
+    }
+  }
+}
