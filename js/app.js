@@ -381,6 +381,8 @@ let adminResultsTypeFilter = "all";
 let studentProgressLessonFilter = "all";
 let studentResultsExpanded = false;
 let studentResultsActiveTool = "";
+let studentResultsActiveSkill = "vocab";
+let testAttemptId = "";
 let adminExerciseHeatmapMode = "performance";
 let editingGroupId = null;
 let adminEditingStudentLessonsId = null;
@@ -479,6 +481,67 @@ async function hashPassword(password){
   }
   return "plain:" + String(password);
 }
+function createStudentAttemptId(){
+  return `deutsch-${Date.now()}-${Math.random().toString(36).slice(2,10)}`;
+}
+function studentMergeItemHistory(previous,result){
+  const history={...(previous && previous.itemHistory && typeof previous.itemHistory==="object" ? previous.itemHistory : {})};
+  // Seed history from the last saved score when upgrading an older result record.
+  if(!Object.keys(history).length && previous && previous.scores && typeof previous.scores==="object"){
+    Object.entries(previous.scores).forEach(([key,value])=>{
+      const correct=value && typeof value==="object" ? Number(value.correct)||0 : Number(value)||0;
+      const total=value && typeof value==="object" ? Number(value.total)||0 : Number(previous.scoreTotals && previous.scoreTotals[key])||0;
+      if(total>0) history[key]={correct,total,attempts:1,lastAttemptId:String(previous.attemptId||""),lastCorrect:correct,lastTotal:total,label:String(previous.exerciseLabels && previous.exerciseLabels[key] || key),kind:"exercise",parentExerciseId:key};
+    });
+  }
+  const attemptId=String(result && result.attemptId || "");
+  if(!attemptId) return history;
+  const scores=result && result.scores && typeof result.scores==="object" ? result.scores : {};
+  const itemScores=result && result.itemScores && typeof result.itemScores==="object" ? result.itemScores : {};
+  const totals=result && result.scoreTotals && typeof result.scoreTotals==="object" ? result.scoreTotals : {};
+  const labels=result && result.exerciseLabels && typeof result.exerciseLabels==="object" ? result.exerciseLabels : {};
+  const itemLabels=result && result.itemLabels && typeof result.itemLabels==="object" ? result.itemLabels : {};
+  const itemMeanings=result && result.itemMeanings && typeof result.itemMeanings==="object" ? result.itemMeanings : {};
+  const itemSkillTypes=result && result.itemSkillTypes && typeof result.itemSkillTypes==="object" ? result.itemSkillTypes : {};
+  const itemParents=result && result.itemParents && typeof result.itemParents==="object" ? result.itemParents : {};
+  const combined={};
+  Object.entries(scores).forEach(([key,value])=>{combined[key]={value,kind:"exercise",label:String(labels[key]||key),parentExerciseId:key};});
+  Object.entries(itemScores).forEach(([key,value])=>{combined[key]={value,kind:"item",label:String(itemLabels[key]||key),meaning:String(itemMeanings[key]||""),skillType:String(itemSkillTypes[key]||""),parentExerciseId:String(itemParents[key]||"")};});
+  // A page sends the full current score map after each exercise. Replace that
+  // attempt's contribution instead of counting every progress update as a new try.
+  Object.entries(history).forEach(([key,old])=>{
+    if(old && old.lastAttemptId===attemptId && !Object.prototype.hasOwnProperty.call(combined,key)){
+      old.correct=Math.max(0,(Number(old.correct)||0)-(Number(old.lastCorrect)||0));
+      old.total=Math.max(0,(Number(old.total)||0)-(Number(old.lastTotal)||0));
+      old.attempts=Math.max(0,(Number(old.attempts)||0)-1);
+      old.lastAttemptId="";old.lastCorrect=0;old.lastTotal=0;
+    }
+  });
+  Object.entries(combined).forEach(([key,entry])=>{
+    const value=entry.value;
+    const correct=value && typeof value==="object" ? Number(value.correct)||0 : Number(value)||0;
+    const total=value && typeof value==="object" ? Number(value.total)||0 : Number(totals[key])||0;
+    if(total<=0) return;
+    const old=history[key] || {correct:0,total:0,attempts:0,label:entry.label,lastAttemptId:"",lastCorrect:0,lastTotal:0};
+    const sameAttempt=old.lastAttemptId===attemptId;
+    if(sameAttempt){
+      old.correct=Math.max(0,(Number(old.correct)||0)-(Number(old.lastCorrect)||0)+correct);
+      old.total=Math.max(0,(Number(old.total)||0)-(Number(old.lastTotal)||0)+total);
+    }else{
+      old.correct=(Number(old.correct)||0)+correct;
+      old.total=(Number(old.total)||0)+total;
+      old.attempts=(Number(old.attempts)||0)+1;
+    }
+    old.lastAttemptId=attemptId;old.lastCorrect=correct;old.lastTotal=total;
+    old.label=String(entry.label||old.label||key);
+    old.kind=entry.kind||old.kind||"exercise";
+    old.parentExerciseId=String(entry.parentExerciseId||old.parentExerciseId||key);
+    if(entry.meaning)old.meaning=entry.meaning;
+    if(entry.skillType)old.skillType=entry.skillType;
+    history[key]=old;
+  });
+  return history;
+}
 function saveStudentResult(moduleId,title,points,maxPoints,extra={}){
   if(!currentUser || currentUser.role !== "student") return;
   const total = Number(maxPoints) || 0;
@@ -491,8 +554,11 @@ function saveStudentResult(moduleId,title,points,maxPoints,extra={}){
   if (!cloudResults[currentUser.id]) cloudResults[currentUser.id] = {};
   const previous = cloudResults[currentUser.id][moduleId] || {};
   const isNewAttempt = result.attemptId ? previous.attemptId !== result.attemptId : true;
+  const itemHistory=studentMergeItemHistory(previous,result);
   cloudResults[currentUser.id][moduleId] = {
     ...result,
+    itemHistory,
+    itemHistoryAttemptId:String(result.attemptId || previous.itemHistoryAttemptId || previous.attemptId || ""),
     attempts:(Number(previous.attempts)||0)+(isNewAttempt?1:0),
     bestPercent:Math.max(Number(previous.bestPercent)||0, Number(result.percent)||0)
   };
@@ -502,6 +568,9 @@ function saveStudentResult(moduleId,title,points,maxPoints,extra={}){
       const old = current || {};
       return {
         ...result,
+        learnedWords:{...(old.learnedWords&&typeof old.learnedWords==="object"?old.learnedWords:{}),...(result.learnedWords&&typeof result.learnedWords==="object"?result.learnedWords:{})},
+        itemHistory:studentMergeItemHistory(old,result),
+        itemHistoryAttemptId:String(result.attemptId || old.itemHistoryAttemptId || old.attemptId || ""),
         attempts:(Number(old.attempts)||0)+(result.attemptId ? (old.attemptId===result.attemptId?0:1) : 1),
         bestPercent:Math.max(Number(old.bestPercent)||0, Number(result.percent)||0)
       };
@@ -530,9 +599,15 @@ function saveEmbeddedProgressReport(data){
     exerciseSeconds:data.exerciseSeconds && typeof data.exerciseSeconds==="object" ? data.exerciseSeconds : {},
     scores:data.scores && typeof data.scores==="object" ? data.scores : {},
     scoreTotals:data.scoreTotals && typeof data.scoreTotals==="object" ? data.scoreTotals : {},
+    itemScores:data.itemScores && typeof data.itemScores==="object" ? data.itemScores : {},
+    itemLabels:data.itemLabels && typeof data.itemLabels==="object" ? data.itemLabels : {},
+    itemMeanings:data.itemMeanings && typeof data.itemMeanings==="object" ? data.itemMeanings : {},
+    itemSkillTypes:data.itemSkillTypes && typeof data.itemSkillTypes==="object" ? data.itemSkillTypes : {},
+    itemParents:data.itemParents && typeof data.itemParents==="object" ? data.itemParents : {},
     exerciseLabels:data.exerciseLabels && typeof data.exerciseLabels==="object" ? data.exerciseLabels : {},
     stageByExercise:data.stageByExercise && typeof data.stageByExercise==="object" ? data.stageByExercise : {},
     stageLabels:data.stageLabels && typeof data.stageLabels==="object" ? data.stageLabels : {},
+    skillType:String(data.skillType||""),
     attemptId:String(data.attemptId||""),
     contentType:String(data.contentType||"test"),
     lessonNumber:Number(data.lessonNumber)||0,
@@ -1047,7 +1122,7 @@ function header(){
     freizeit:"تعلّم", stadt:"تعلّم", "family-tree":"تعلّم",
     category:"تعلّم", learning:"تعلّم", test:"تعلّم",
     "test-result":"تعلّم", "custom-content":"تعلّم", talk:"تكلّم", sessions:"الجلسات",
-    community:"المجتمع", competition:"المنافسة", "student-results":"تقدّمي", settings:"الإعدادات"
+    community:"المجتمع", competition:"المنافسة", "student-results":"تقدّمي", settings:settingsStrings().settings
   };
   const title = pageTitles[page] || "Deutsch";
   const level = ["a2-level-home","a2-lesson-html","a2-course-content","a2-test-html"].includes(page) ? "A2" : (selectedLevel || "A1.1");
@@ -1118,14 +1193,20 @@ function pageShell(eyebrow,title,subtitle,content){
     "tests","test-categories","lesson","category","learning","test","test-result",
     "sessions","community","settings"
   ]);
+  const onSettings = page==="settings";
+  const prefs = onSettings ? readSettingsLanguages() : null;
+  const languageDir = prefs?.ui === "ar" || !prefs ? "rtl" : "ltr";
+  const backText = onSettings ? settingsStrings().back : "رجوع";
+  const backArrow = languageDir === "rtl" ? "→" : "←";
   const backControl = pagesWithHeaderBack.has(page)
-    ? `<div class="student-page-back-row"><button type="button" class="student-page-back" data-action="back"><span aria-hidden="true">→</span><span>رجوع</span></button></div>`
+    ? `<div class="student-page-back-row"><button type="button" class="student-page-back" data-action="back"><span aria-hidden="true">${backArrow}</span><span>${escapeHtml(backText)}</span></button></div>`
     : "";
-  return studentLayout(`${backControl}<section class="student-page-heading">
+  const result = `${backControl}<section class="student-page-heading">
     <p class="student-eyebrow">${eyebrow}</p>
     <h1>${title}</h1>
     <p>${subtitle}</p>
-  </section><div class="student-page-content">${content}</div>`);
+  </section><div class="student-page-content">${content}</div>`;
+  return studentLayout(onSettings?`<div class="settings-page-lang-wrap" lang="${prefs.ui}" dir="${languageDir}">${result}</div>`:result);
 }
 
 function dailyPlanStorageKey(){
@@ -1438,6 +1519,69 @@ function saveCourseProgress(level,no,change,writeCloud=true){
   }
   return next;
 }
+
+function recordStudentLearnedWord(level,no,german,meaning="",source="lesson"){
+  if(!currentUser || currentUser.role!=="student")return false;
+  const word=String(german||"").replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu,"").replace(/^\s*🔊\s*/,"").replace(/\s+/g," ").trim();
+  if(!word || word.length>85 || /[.!?؟]$/.test(word))return false;
+  const normalized=studentNormalizeSkillText(word);
+  if(!normalized)return false;
+  const safeKey=normalized.replace(/[^a-z0-9]+/g,"-").replace(/^-|-$/g,"") || `word-${Date.now()}`;
+  const moduleId=`learned-words-${String(level||"A1").toLowerCase()}-${Number(no)}`;
+  const previous=cloudResults?.[currentUser.id]?.[moduleId]||{};
+  const learnedWords={...(previous.learnedWords&&typeof previous.learnedWords==="object"?previous.learnedWords:{})};
+  const old=learnedWords[safeKey]||{};
+  const resolvedMeaning=String(meaning||studentVocabularyMeaning(word)||old.meaning||"").trim();
+  const now=new Date().toISOString();
+  learnedWords[safeKey]={
+    word,meaning:resolvedMeaning,
+    firstLearnedAt:old.firstLearnedAt||now,
+    lastSeenAt:now,
+    source:String(source||old.source||"lesson").slice(0,40)
+  };
+  // Save in the student's existing results node so words sync across devices
+  // using the same Firebase permissions as test results. This is not a graded score.
+  saveStudentResult(moduleId,`Wortschatz · ${String(level||"A1")} · Lektion ${Number(no)}`,0,0,{
+    contentType:"lesson-vocabulary",activityType:"lesson-vocabulary",source:"lesson-word-learning",
+    lessonNumber:Number(no),level:String(level||"A1"),visited:{words:true},learnedWords,
+    attemptId:`${moduleId}-word-list`
+  });
+  return true;
+}
+
+function attachVocabularyTracking(doc,level,no){
+  if(!doc || doc.__deutschVocabularyTrackingAttached)return;
+  try{doc.__deutschVocabularyTrackingAttached=true;}catch(error){}
+  doc.addEventListener("click",event=>{
+    const target=event.target?.closest?.('.item:not(.sentence),.word-card,.vocab-card,.vocabulary-card,.a2-vocab-card,.hotspot,.poster-hotspot,.term,[data-word],[data-german],[data-de],[data-say],[data-speak]');
+    if(!target || target.closest('.sentence,.sentence-card,.dialogue-line,.a2-example-chip,[data-skill="sentences"]'))return;
+    if(target.hasAttribute("data-speak") && !target.classList.contains("a2-vocab-card"))return;
+    if(target.classList.contains("hotspot") && (target.classList.contains("ui")||target.classList.contains("title")))return;
+    let german=target.dataset.word||target.dataset.german||target.dataset.de||target.dataset.say||target.dataset.speak||"";
+    let arabic=target.dataset.meaning||target.dataset.translation||target.dataset.ar||"";
+    const deNode=target.querySelector?.('.de-label,.word-de,.german,.de,.a2-vocab-de');
+    const arNode=target.querySelector?.('.ar-label,.small-ar,.translation,.meaning,.ar,.a2-vocab-ar');
+    if(!german && deNode)german=deNode.textContent||"";
+    if(!arabic && arNode)arabic=arNode.textContent||"";
+    const label=String(target.getAttribute("aria-label")||target.title||"").trim();
+    if(label){
+      const parts=label.split(/\s*[—–|]\s*/);
+      if(!german && parts[0])german=parts[0].replace(/^(?:Aussprache hören:|Aussprache:|Höre|Hören:|Höre)\s*/i,"").trim();
+      if(!arabic && parts.length>1)arabic=parts.slice(1).join(" — ").trim();
+    }
+    if(!german && target.classList.contains("term"))german=target.textContent||"";
+    if(!german)return;
+    recordStudentLearnedWord(level,no,german,arabic,"interactive-card");
+  },true);
+}
+
+function trackStandaloneVocabularyFrame(frame,level,no){
+  if(!frame || frame.dataset.vocabularyTrackingAttached==="1")return;
+  frame.dataset.vocabularyTrackingAttached="1";
+  frame.addEventListener("load",()=>{
+    try{attachVocabularyTracking(frame.contentDocument,level,no);}catch(error){console.warn("Vocabulary tracking could not attach to lesson frame",error);}
+  });
+}
 async function loadStudentCourseProgressCloud(){
   if(!currentUser || currentUser.role!=="student" || !firebaseReady || demoMode) return;
   const uid=currentUser.id;
@@ -1503,9 +1647,9 @@ function launchPendingCourse(mode){
       lastTabLabel:"",totalTabs:0,visitedTabs:[],scrollTop:0,scrollRatio:0,
       nativeStages:null,nativeQuiz:null,nativeStageResults:null,courseResultSignature:null,scorePerStage:10,legacyUnscoredStages:0,formDraft:null,
       startedAt:new Date().toISOString(),restartAt:mode==="restart"?new Date().toISOString():null},false);
-  }else{
-    saveCourseProgress(pending.level,pending.no,{},false);
   }
+  // Resuming is a READ operation. Do not bump updatedAt on the parent record;
+  // it could otherwise outrank the course's last real navigation checkpoint.
   pending.onLaunch();
 }
 /* ===== Embedded Kurs HTML bridge =====
@@ -1612,6 +1756,7 @@ function addLessonInternalBackButton(doc,level,no){
       }
     };
   }catch(error){console.warn("Lesson integration could not be attached",error);}
+  attachVocabularyTracking(doc,level,no);
 }
 
 function storeCourseStageResults(level,no,native,explicitResults){
@@ -1967,7 +2112,7 @@ function trackCourseIframe(frame,level,no){
           // New HTML courses restore state before their first paint. Trust it
           // when it matches the stored stage; otherwise use the parent bridge.
           const nativeNow=readNativeCourseState(win);
-          const nativeAlreadyRestored=!!(win.DeutschCourseNativeSyncV7?.restored && nativeNow);
+          const nativeAlreadyRestored=!!((win.DeutschCourseNativeSyncV8?.restored || win.DeutschCourseNativeSyncV7?.restored) && nativeNow);
           if(nativeAlreadyRestored){
             // The HTML owns the cursor: a newer native snapshot may repair a
             // stale parent record incorrectly overwritten with slide 1.
@@ -2063,7 +2208,7 @@ function saveActiveCourseBeforeExit(){
   if(activeCourseFrame){
     // Persist synchronously while the iframe still exists, before render() removes it.
     try{
-      activeCourseFrame.frame.contentWindow?.DeutschCourseNativeSyncV7?.save?.();
+      (activeCourseFrame.frame.contentWindow?.DeutschCourseNativeSyncV8 || activeCourseFrame.frame.contentWindow?.DeutschCourseNativeSyncV7)?.save?.();
       activeCourseFrame.persist?.();
     }catch(error){}
     const record=getCourseProgress(activeCourseFrame.level,activeCourseFrame.no);
@@ -3799,38 +3944,95 @@ function sendCommunityMessage(event){
   localStorage.setItem(communityStorageKey(communityRoom),JSON.stringify(messages.slice(-100)));
   renderCommunity();
 }
+// Settings V10: separate full-screen pages, with independent saved language choices.
+// The UI language applies to the Settings screens (not unrelated app screens).
+const SETTINGS_LANGUAGES = {ar:"العربية",fr:"Français",en:"English"};
+let settingsActivePanel = "account";
+const SETTINGS_DICTIONARY = {
+ ar:{
+  settings:"الإعدادات",subtitle:"حسابك وتفضيلات التعلّم",back:"رجوع",settingsDesc:"اختار القسم اللي بغيتي تبدّل فيه الإعدادات.",
+  studentProfile:"ملف المتعلّم",welcome:"مرحبا بك",currentLevel:"المستوى الحالي",learnComfort:"تعلّم على راحتك",level:"المستوى",uiLanguage:"لغة الإعدادات",accountType:"نوع الحساب",student:"متعلّم",
+  account:"الحساب",accountTitle:"معلومات الحساب",accountDesc:"تفاصيل الحساب والمستوى",preferences:"التفضيلات",learnTitle:"إعدادات التعلّم",learnDesc:"اللغة والترجمة",display:"سهولة القراءة",displayTitle:"حجم الكتابة والأيقونات",displayDesc:"حجم مناسب لشاشتك",open:"فتح",name:"الاسم",email:"البريد الإلكتروني",role:"الدور",availableLevel:"المستوى المتاح حالياً",lessons:"10 دروس",
+  uiLabel:"لغة واجهة الإعدادات",uiHelp:"يمكنك تبديل اللغة المستعملة داخل صفحات الإعدادات دون تغيير لغة الدرس الألماني.",translationLabel:"لغة ترجمة الدروس",translationHelp:"تُحفظ لغة الترجمة المفضلة بشكل مستقل وتُرسل لصفحات الدروس. الترجمات الأصلية المدمجة في صفحات HTML القديمة ستظل كما هي حتى تتوفر لها نسخ مترجمة.",langSaved:"تم حفظ اختيار اللغة.",displayHelp:"اختار الحجم اللي مريح لعينيك. التغيير كيتطبّق مباشرة على صفحات المنصة والتمارين وكيبقى محفوظ.",textSize:"حجم الكتابة",iconSize:"حجم الأيقونات",smaller:"أصغر",larger:"أكبر",reset:"إرجاع الحجم الافتراضي",logout:"تسجيل الخروج",saved:"التعديلات كتتحفظ تلقائياً على هاد الجهاز.",fullscreenHint:"صفحة مستقلة بعرض الشاشة كامل",choice:"اختار اللغة"
+ },
+ fr:{
+  settings:"Paramètres",subtitle:"Compte et préférences d'apprentissage",back:"Retour",settingsDesc:"Choisissez une rubrique pour modifier ses paramètres.",
+  studentProfile:"Profil de l'apprenant",welcome:"Bienvenue",currentLevel:"Niveau actuel",learnComfort:"Apprenez à votre rythme",level:"Niveau",uiLanguage:"Langue des paramètres",accountType:"Type de compte",student:"Apprenant",
+  account:"Compte",accountTitle:"Informations du compte",accountDesc:"Coordonnées et niveau",preferences:"Préférences",learnTitle:"Préférences d'apprentissage",learnDesc:"Langue et traduction",display:"Lisibilité",displayTitle:"Taille du texte et des icônes",displayDesc:"Adapter l'affichage",open:"Ouvrir",name:"Nom",email:"Adresse e-mail",role:"Rôle",availableLevel:"Niveau accessible",lessons:"10 leçons",
+  uiLabel:"Langue de l'interface des paramètres",uiHelp:"Changez la langue des écrans Paramètres sans modifier l'allemand des leçons.",translationLabel:"Langue de traduction des leçons",translationHelp:"Votre préférence de traduction est enregistrée et transmise aux leçons. Les anciennes pages HTML gardent leur traduction intégrée tant qu'une version traduite n'est pas disponible.",langSaved:"Préférence de langue enregistrée.",displayHelp:"Choisissez la taille la plus confortable. Les changements s'appliquent immédiatement et sont enregistrés.",textSize:"Taille du texte",iconSize:"Taille des icônes",smaller:"Plus petit",larger:"Plus grand",reset:"Rétablir les tailles par défaut",logout:"Se déconnecter",saved:"Vos préférences sont enregistrées automatiquement sur cet appareil.",fullscreenHint:"Écran indépendant en plein écran",choice:"Choisir une langue"
+ },
+ en:{
+  settings:"Settings",subtitle:"Account and learning preferences",back:"Back",settingsDesc:"Choose a section to customize its settings.",
+  studentProfile:"Learner profile",welcome:"Welcome",currentLevel:"Current level",learnComfort:"Learn at your own pace",level:"Level",uiLanguage:"Settings language",accountType:"Account type",student:"Learner",
+  account:"Account",accountTitle:"Account information",accountDesc:"Your account and level",preferences:"Preferences",learnTitle:"Learning settings",learnDesc:"Languages and translation",display:"Readability",displayTitle:"Text and icon size",displayDesc:"Adjust your display",open:"Open",name:"Name",email:"Email address",role:"Role",availableLevel:"Available level",lessons:"10 lessons",
+  uiLabel:"Settings interface language",uiHelp:"Change the language used on Settings screens without changing the German lesson material.",translationLabel:"Lesson translation language",translationHelp:"Your preferred translation language is saved and sent to lesson pages. Existing hard-coded translations in older HTML lessons remain unchanged until translated versions are available.",langSaved:"Language preference saved.",displayHelp:"Choose a comfortable text and icon size. Changes apply immediately and remain saved.",textSize:"Text size",iconSize:"Icon size",smaller:"Smaller",larger:"Larger",reset:"Restore default sizes",logout:"Log out",saved:"Changes are automatically saved on this device.",fullscreenHint:"Separate full-screen page",choice:"Choose language"
+ }
+};
+function settingsPrefStorageKey(){return `deutsch_a1_settings_languages_v1_${currentUser?.id||"guest"}`;}
+function readSettingsLanguages(){
+ let data={};
+ try{data=JSON.parse(localStorage.getItem(settingsPrefStorageKey())||"{}");}catch(error){}
+ return {ui:SETTINGS_LANGUAGES[data.ui]?data.ui:"ar",translation:SETTINGS_LANGUAGES[data.translation]?data.translation:"ar"};
+}
+function saveSettingsLanguages(prefs){
+ const cleaned={ui:SETTINGS_LANGUAGES[prefs.ui]?prefs.ui:"ar",translation:SETTINGS_LANGUAGES[prefs.translation]?prefs.translation:"ar"};
+ try{
+  localStorage.setItem(settingsPrefStorageKey(),JSON.stringify(cleaned));
+  // This global key makes the translation preference available to standalone lesson HTML files.
+  localStorage.setItem("deutsch_a1_translation_language_v1",cleaned.translation);
+ }catch(error){}
+ broadcastSettingsTranslationLanguage(cleaned);
+}
+function broadcastSettingsTranslationLanguage(prefs=readSettingsLanguages()){
+ document.querySelectorAll("iframe").forEach(frame=>{
+  try{frame.contentWindow.postMessage({type:"deutsch-a1-language-preferences",settingsLanguage:prefs.ui,translationLanguage:prefs.translation},"*");}catch(error){}
+ });
+}
+function settingsStrings(){return SETTINGS_DICTIONARY[readSettingsLanguages().ui];}
+function settingsLanguageOptions(selected){return Object.entries(SETTINGS_LANGUAGES).map(([code,label])=>`<option value="${code}" ${code===selected?"selected":""}>${label}</option>`).join("");}
+function settingsSectionCards(t){
+ const sections=[
+  {id:"account",icon:"👤",tone:"blue",eyebrow:t.account,title:t.accountTitle,desc:t.accountDesc},
+  {id:"learning",icon:"📖",tone:"purple",eyebrow:t.preferences,title:t.learnTitle,desc:t.learnDesc},
+  {id:"display",icon:"⚙",tone:"orange",eyebrow:t.display,title:t.displayTitle,desc:t.displayDesc}
+ ];
+ return sections.map(item=>`<button type="button" class="settings-ref-panel settings-section-open" data-action="settings-open-panel" data-panel="${item.id}" aria-label="${escapeHtml(item.open+': '+item.title)}"><span class="settings-ref-panel-icon settings-ref-panel-icon-${item.tone}" aria-hidden="true">${item.icon}</span><span class="settings-section-open-copy"><small class="settings-ref-panel-eyebrow">${escapeHtml(item.eyebrow)}</small><strong>${escapeHtml(item.title)}</strong><small>${escapeHtml(item.desc)}</small></span><span class="settings-section-chevron" aria-hidden="true">‹</span></button>`).join("");
+}
 function renderSettings(){
-  const profile = currentStudentProfile || {};
-  const displayPrefs = readUiDisplayPreferences();
-  const textPercent = Math.round(displayPrefs.textScale * 100);
-  const iconPercent = Math.round(displayPrefs.iconScale * 100);
-  const content = `
-    <section class="settings-profile-card"><span class="settings-avatar">${escapeHtml((currentUser?.name||"S").slice(0,1).toUpperCase())}</span><div><h2>${escapeHtml(currentUser?.name||"متعلّم")}</h2><p>${escapeHtml(currentUser?.email||"")}</p><span class="settings-level-badge">المستوى الحالي · A1</span></div></section>
-    <section class="dashboard-section"><div class="dashboard-section-head"><div><span class="section-overline">الحساب</span><h2>معلومات الحساب</h2></div></div><div class="settings-list">
-      <div><span>الاسم</span><strong>${escapeHtml(profile.name||currentUser?.name||"—")}</strong></div>
-      <div><span>البريد الإلكتروني</span><strong dir="ltr">${escapeHtml(profile.email||currentUser?.email||"—")}</strong></div>
-      <div><span>الدور</span><strong>متعلّم</strong></div>
-      <div><span>المستوى المتاح حالياً</span><strong>A1 · 10 دروس</strong></div>
-    </div></section>
-    <section class="dashboard-section"><div class="dashboard-section-head"><div><span class="section-overline">التفضيلات</span><h2>إعدادات التعلّم</h2></div></div><div class="settings-note"><strong>لغة الواجهة: العربية</strong><p>لغة الشرح والترجمة هي العربية، أما أمثلة التعلّم والحوارات فتبقى بالألمانية حتى تتدرّب عليها.</p></div></section>
-    <section class="dashboard-section ui-display-settings">
-      <div class="dashboard-section-head"><div><span class="section-overline">سهولة القراءة</span><h2>حجم الكتابة والأيقونات</h2></div></div>
-      <p class="ui-display-intro">اختار الحجم اللي مريح لعينيك. التغيير كيتطبّق مباشرة على صفحات المنصة والتمارين وكيبقى محفوظ.</p>
-      <div class="ui-scale-control">
-        <div class="ui-scale-heading"><label for="uiTextScale">حجم الكتابة</label><output id="uiTextScaleValue" for="uiTextScale">${textPercent}%</output></div>
-        <input class="ui-scale-slider" id="uiTextScale" type="range" min="90" max="130" step="1" value="${textPercent}">
-        <div class="ui-scale-hints"><span>أصغر</span><span>أكبر</span></div>
-      </div>
-      <div class="ui-scale-control">
-        <div class="ui-scale-heading"><label for="uiIconScale">حجم الأيقونات</label><output id="uiIconScaleValue" for="uiIconScale">${iconPercent}%</output></div>
-        <input class="ui-scale-slider" id="uiIconScale" type="range" min="90" max="140" step="1" value="${iconPercent}">
-        <div class="ui-scale-hints"><span>أصغر</span><span>أكبر</span></div>
-      </div>
-      <button type="button" class="ui-display-reset-btn" data-action="ui-reset-display">إرجاع الحجم الافتراضي</button>
-    </section>
-    <button type="button" class="settings-logout-btn" data-action="logout">تسجيل الخروج</button>
-  `;
-  app.innerHTML = pageShell("الإعدادات","إعدادات حسابك","راجع معلومات حسابك وتفضيلات التعلّم.",content);
+ const t=settingsStrings(),prefs=readSettingsLanguages();
+ const lang=prefs.ui,dir=lang==="ar"?"rtl":"ltr";
+ const studentName=escapeHtml(currentUser?.name||t.student);
+ const accountEmail=escapeHtml(currentStudentProfile?.email||currentUser?.email||"—");
+ const content=`<div class="settings-reference-v1 settings-reference-v10" lang="${lang}" dir="${dir}">
+  <section class="settings-ref-hero" aria-label="${escapeHtml(t.studentProfile)}">
+   <div class="settings-ref-hero-shine" aria-hidden="true"></div>
+   <div class="settings-ref-hero-top"><span class="settings-ref-kicker"><span class="settings-ref-kicker-dot"></span> ${escapeHtml(t.studentProfile)}</span><span class="settings-ref-hero-sparkle" aria-hidden="true">✦</span></div>
+   <div class="settings-ref-hero-main"><span class="settings-ref-avatar" aria-hidden="true">${escapeHtml((currentUser?.name||"S").slice(0,1).toUpperCase())}</span><div class="settings-ref-hero-copy"><span class="settings-ref-welcome">${escapeHtml(t.welcome)} 👋</span><h2>${studentName}</h2><p dir="auto">${accountEmail}</p></div></div>
+   <div class="settings-ref-hero-bottom"><span class="settings-ref-level-chip">✦ ${escapeHtml(t.currentLevel)} · A1</span><span class="settings-ref-hero-caption">${escapeHtml(t.learnComfort)}</span></div>
+  </section>
+  <div class="settings-ref-small-cards"><article class="settings-ref-small-card settings-ref-small-card-blue"><span class="settings-ref-small-icon">🎓</span><div><small>${escapeHtml(t.level)}</small><strong>A1</strong></div></article>
+  <article class="settings-ref-small-card settings-ref-small-card-mint"><span class="settings-ref-small-icon">🌐</span><div><small>${escapeHtml(t.uiLanguage)}</small><strong>${escapeHtml(SETTINGS_LANGUAGES[lang])}</strong></div></article>
+  <article class="settings-ref-small-card settings-ref-small-card-rose"><span class="settings-ref-small-icon">👤</span><div><small>${escapeHtml(t.accountType)}</small><strong>${escapeHtml(t.student)}</strong></div></article></div>
+  <p class="settings-section-intro">${escapeHtml(t.settingsDesc)}</p>
+  <nav class="settings-section-list" aria-label="${escapeHtml(t.settings)}">${settingsSectionCards(t)}</nav>
+  <div class="settings-ref-signout"><button type="button" class="settings-logout-btn" data-action="logout"><span aria-hidden="true">↪</span>${escapeHtml(t.logout)}</button></div>
+ </div>`;
+ app.innerHTML=pageShell(t.settings,t.subtitle,t.settingsDesc,content);
+}
+function renderSettingsDetail(){
+ const prefs=readSettingsLanguages(),t=SETTINGS_DICTIONARY[prefs.ui];
+ const rtl=prefs.ui==="ar",dir=rtl?"rtl":"ltr";
+ const profile=currentStudentProfile||{};
+ const displayPrefs=readUiDisplayPreferences();
+ const textPercent=Math.round(displayPrefs.textScale*100),iconPercent=Math.round(displayPrefs.iconScale*100);
+ const section=settingsActivePanel;
+ const meta={account:{name:t.accountTitle,eyebrow:t.account,icon:"👤",tone:"blue"},learning:{name:t.learnTitle,eyebrow:t.preferences,icon:"📖",tone:"purple"},display:{name:t.displayTitle,eyebrow:t.display,icon:"⚙",tone:"orange"}}[section]||{name:t.accountTitle,eyebrow:t.account,icon:"👤",tone:"blue"};
+ let body="";
+ if(section==="account")body=`<section class="settings-detail-card"><div class="settings-detail-user"><span class="settings-ref-avatar">${escapeHtml((currentUser?.name||"S").slice(0,1).toUpperCase())}</span><div><strong>${escapeHtml(currentUser?.name||t.student)}</strong><small dir="auto">${escapeHtml(profile.email||currentUser?.email||"—")}</small></div></div>
+  <div class="settings-ref-list settings-list"><div class="settings-ref-list-row"><span>${escapeHtml(t.name)}</span><strong>${escapeHtml(profile.name||currentUser?.name||"—")}</strong></div><div class="settings-ref-list-row"><span>${escapeHtml(t.email)}</span><strong dir="auto">${escapeHtml(profile.email||currentUser?.email||"—")}</strong></div><div class="settings-ref-list-row"><span>${escapeHtml(t.role)}</span><strong>${escapeHtml(t.student)}</strong></div><div class="settings-ref-list-row"><span>${escapeHtml(t.availableLevel)}</span><strong>A1 · ${escapeHtml(t.lessons)}</strong></div></div></section>`;
+ if(section==="learning")body=`<section class="settings-detail-card"><div class="settings-detail-field"><span class="settings-detail-field-icon">🌐</span><label for="settingsUiLanguage">${escapeHtml(t.uiLabel)}</label><select id="settingsUiLanguage" class="settings-language-select" aria-label="${escapeHtml(t.uiLabel)}">${settingsLanguageOptions(prefs.ui)}</select><p>${escapeHtml(t.uiHelp)}</p></div><div class="settings-detail-field"><span class="settings-detail-field-icon">🗣️</span><label for="settingsTranslationLanguage">${escapeHtml(t.translationLabel)}</label><select id="settingsTranslationLanguage" class="settings-language-select" aria-label="${escapeHtml(t.translationLabel)}">${settingsLanguageOptions(prefs.translation)}</select><p>${escapeHtml(t.translationHelp)}</p><div class="settings-translation-preview"><span lang="de">Guten Morgen!</span><span aria-hidden="true">→</span><strong lang="${prefs.translation}">${escapeHtml({ar:"صباح الخير!",fr:"Bonjour !",en:"Good morning!"}[prefs.translation])}</strong></div></div></section>`;
+ if(section==="display")body=`<section class="settings-detail-card ui-display-settings"><p class="ui-display-intro">${escapeHtml(t.displayHelp)}</p><div class="ui-scale-control"><div class="ui-scale-heading"><label for="uiTextScale">${escapeHtml(t.textSize)}</label><output id="uiTextScaleValue" for="uiTextScale">${textPercent}%</output></div><input class="ui-scale-slider" id="uiTextScale" type="range" min="90" max="130" step="1" value="${textPercent}"><div class="ui-scale-hints"><span>${escapeHtml(t.smaller)}</span><span>${escapeHtml(t.larger)}</span></div></div><div class="ui-scale-control"><div class="ui-scale-heading"><label for="uiIconScale">${escapeHtml(t.iconSize)}</label><output id="uiIconScaleValue" for="uiIconScale">${iconPercent}%</output></div><input class="ui-scale-slider" id="uiIconScale" type="range" min="90" max="140" step="1" value="${iconPercent}"><div class="ui-scale-hints"><span>${escapeHtml(t.smaller)}</span><span>${escapeHtml(t.larger)}</span></div></div><button type="button" class="ui-display-reset-btn" data-action="ui-reset-display">↺ ${escapeHtml(t.reset)}</button></section>`;
+ app.innerHTML=`<main class="settings-detail-screen" lang="${prefs.ui}" dir="${dir}" role="main"><div class="settings-detail-layout"><header class="settings-detail-topbar"><button type="button" class="settings-detail-back" data-action="settings-back" aria-label="${escapeHtml(t.back)}"><span aria-hidden="true">${rtl?'→':'←'}</span>${escapeHtml(t.back)}</button><span class="settings-detail-topbar-label">${escapeHtml(t.settings)}</span></header><div class="settings-detail-hero"><div class="settings-ref-panel-icon settings-ref-panel-icon-${meta.tone}" aria-hidden="true">${meta.icon}</div><span>${escapeHtml(meta.eyebrow)}</span><h1>${escapeHtml(meta.name)}</h1><p>${escapeHtml(t.fullscreenHint)}</p></div>${body}<p class="settings-detail-saved">✓ ${escapeHtml(t.saved)}</p></div></main>`;
 }
 
 function renderLogin(){
@@ -4962,6 +5164,203 @@ function renderAdmin(){
 }
 
 
+const STUDENT_RESULT_SKILLS = [
+  {id:"vocab",label:"المفردات",de:"Wortschatz",icon:"📚",description:"الكلمات والمعاني والأسماء والأفعال والصفات"},
+  {id:"sentences",label:"تركيب الجمل",de:"Satzbau",icon:"🧩",description:"ترتيب الكلمات والقواعد وتكوين الجمل"},
+  {id:"speaking",label:"الكلام والحوار",de:"Sprechen",icon:"💬",description:"الحوار والتواصل الشفهي"},
+  {id:"writing",label:"الكتابة",de:"Schreiben",icon:"✍️",description:"الترجمة الكتابية وكتابة الكلمات والجمل"},
+  {id:"listening",label:"الاستماع",de:"Hören",icon:"🎧",description:"فهم الكلمات والجمل المسموعة"}
+];
+function studentNormalizeSkillText(value){
+  return String(value||"").toLocaleLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/ß/g,"ss").replace(/\s+/g," ").trim();
+}
+function studentSkillForResultRow(result,row){
+  const moduleId=studentNormalizeSkillText(result && result.moduleId);
+  const title=studentNormalizeSkillText(result && result.title);
+  const label=studentNormalizeSkillText(row && row.label);
+  const combined=`${moduleId} ${title} ${label}`;
+  const explicit=studentNormalizeSkillText(row && row.skillType || result && result.skillType);
+  if(["vocab","sentences","speaking","writing","listening"].includes(explicit))return explicit;
+  const categoryMatch=moduleId.match(/^lektion-\d+-(verben|nomen|adjektive|prapositionen|grammatik)$/);
+  if(categoryMatch)return categoryMatch[1]==="grammatik"?"sentences":"vocab";
+  if(adminResultType(result)==="podcast" || /hoeren|horen|hordetektiv|audio|podcast|listening/.test(combined))return "listening";
+  if(/sprechen|dialog|gespraech|aussprache|mundlich|konversation|speaking/.test(combined))return "speaking";
+  if(/schreib|schrift|writing|ubersetzungswerkstatt|text verfassen|text schreiben/.test(combined))return "writing";
+  if(/satzbau|luckensatze|grammatik|praposition|fehler|worter sortieren|am oder im|verbposition|konjug|verben im prasens|verben im alltag|wie, wo|wo oder wann|mit dem bus|worter ordnen/.test(combined))return "sentences";
+  if(/wortschatz|worter verbinden|artikel-detektiv|ubersetzungsquiz|vokabel|wetter-detektiv|jahreszeiten|wochentage|adjektiv|nomen|gegenteile|kategorien|verben unterwegs|worter match/.test(combined))return "vocab";
+  return null;
+}
+function studentSkillRowsForResult(result){
+  const history=result && result.itemHistory && typeof result.itemHistory==="object" ? result.itemHistory : null;
+  if(history && Object.keys(history).length){
+    const rows=Object.entries(history).map(([key,value])=>{
+      const points=Number(value && value.correct)||0;
+      const max=Number(value && value.total)||0;
+      return {key,label:String(value && value.label || (result.exerciseLabels && result.exerciseLabels[key]) || key),points,max,percent:max>0?Math.round(points/max*100):null,attempts:Math.max(1,Number(value && value.attempts)||1),kind:String(value && value.kind||"exercise"),parentExerciseId:String(value && value.parentExerciseId||key),meaning:String(value && value.meaning||""),skillType:String(value && value.skillType||"")};
+    }).filter(item=>item.percent!==null);
+    const detailedParents=new Set(rows.filter(item=>item.kind==="item" && item.parentExerciseId).map(item=>item.parentExerciseId));
+    return rows.filter(item=>item.kind==="item" || !detailedParents.has(item.key));
+  }
+  return adminExerciseScoreRows(result).map(item=>({...item,attempts:Math.max(1,Number(result && result.attempts)||1)}));
+}
+function studentVocabularyMeaning(word){
+  const target=studentNormalizeSkillText(word);
+  if(!target)return "";
+  for(const lesson of lessons){
+    for(const entries of Object.values(lesson.data||{})){
+      for(const entry of entries||[]){
+        if(studentNormalizeSkillText(entry && entry[0])===target)return String(entry[1]||"");
+      }
+    }
+  }
+  const extraMeanings={
+    "grosseltern":"الأجداد","der grossvater":"الجد","die grossmutter":"الجدة","eltern":"الوالدان",
+    "der vater":"الأب","die mutter":"الأم","der onkel":"العم / الخال","die tante":"العمة / الخالة",
+    "geschwister":"الإخوة والأخوات","der sohn":"الابن","der bruder":"الأخ","die tochter":"الابنة",
+    "die schwester":"الأخت","der cousin":"ابن العم / الخال","die cousine":"ابنة العم / الخال",
+    "enkel":"الأحفاد","der enkel":"الحفيد","die enkelin":"الحفيدة",
+    "die zahlen":"الأرقام","eins":"واحد","zwei":"اثنان","drei":"ثلاثة","vier":"أربعة","funf":"خمسة",
+    "sechs":"ستة","sieben":"سبعة","acht":"ثمانية","neun":"تسعة","zehn":"عشرة",
+    "rad fahren":"ركوب الدراجة","freunde treffen":"لقاء الأصدقاء","ins kino gehen":"الذهاب إلى السينما",
+    "feiern":"الاحتفال","in den park gehen":"الذهاب إلى الحديقة","musik horen":"الاستماع إلى الموسيقى",
+    "computerspiele spielen":"لعب ألعاب الحاسوب","schwimmen":"السباحة","tanzen":"الرقص"
+  };
+  return extraMeanings[target]||"";
+}
+function studentBuildSkillReport(results,courseRecords={}){
+  const buckets=Object.fromEntries(STUDENT_RESULT_SKILLS.map(skill=>[skill.id,{...skill,itemMap:{},learnedMap:{},points:0,max:0}]));
+  const addLearnedWords=(record,lessonIndex)=>{
+    const words=record?.learnedWords&&typeof record.learnedWords==="object"?Object.values(record.learnedWords):[];
+    words.forEach(entry=>{
+      const label=String(entry&&(entry.word||entry.de)||"").trim();
+      const normalized=studentNormalizeSkillText(label);
+      if(!label||!normalized)return;
+      const key=`${lessonIndex}:${normalized}`;
+      const old=buckets.vocab.learnedMap[key]||{key,label,lessonIndex,level:String(record.level||"A1"),meaning:"",learnedAt:"",source:"lesson"};
+      old.label=label;
+      old.level=String(record.level||old.level||"A1");
+      old.meaning=String(entry.meaning||old.meaning||studentVocabularyMeaning(label)||"");
+      old.learnedAt=String(entry.lastSeenAt||entry.firstLearnedAt||old.learnedAt||"");
+      old.source=String(entry.source||old.source||"lesson");
+      buckets.vocab.learnedMap[key]=old;
+    });
+  };
+  (results||[]).forEach(result=>{
+    if(!result || typeof result!=="object")return;
+    const resultType=adminResultType(result);
+    const lessonIndex=adminResultLessonIndex(result);
+    addLearnedWords(result,lessonIndex);
+    let rows=studentSkillRowsForResult(result);
+    if(!rows.length){
+      const percent=adminResultPercent(result);
+      const points=Number(result.points)||0;
+      const max=Number(result.maxPoints)||0;
+      if(percent!==null && max>0)rows=[{key:"summary",label:String(result.title||result.moduleId||"نتيجة"),points,max,percent,attempts:Math.max(1,Number(result.attempts)||1)}];
+    }
+    rows.forEach(row=>{
+      const skillId=studentSkillForResultRow(result,row);
+      if(!skillId || !buckets[skillId] || row.percent===null || !(Number(row.max)>0))return;
+      const label=String(row.label||row.key||"تمرين").trim();
+      const normalized=studentNormalizeSkillText(label);
+      const key=`${lessonIndex}:${normalized||String(row.key||"")}`;
+      const old=buckets[skillId].itemMap[key] || {
+        key,label,lessonIndex,points:0,max:0,attempts:0,sourceTitle:String(result.title||result.moduleId||"")
+      };
+      old.points+=Number(row.points)||0;
+      old.max+=Number(row.max)||0;
+      old.attempts+=Math.max(1,Number(row.attempts)||1);
+      old.label=label||old.label;
+      old.meaning=String(row.meaning||old.meaning||"");
+      old.sourceTitle=String(result.title||old.sourceTitle||"");
+      buckets[skillId].itemMap[key]=old;
+    });
+  });
+  Object.values(courseRecords||{}).forEach(record=>{
+    if(!record || typeof record!=="object")return;
+    const lessonIndex=Number(record.lessonNumber)>=1?Number(record.lessonNumber)-1:-1;
+    addLearnedWords(record,lessonIndex);
+  });
+  return STUDENT_RESULT_SKILLS.map(skill=>{
+    const bucket=buckets[skill.id];
+    const items=Object.values(bucket.itemMap).map(item=>{
+      const percent=item.max>0?Math.round(item.points/item.max*100):null;
+      return {...item,percent,meaning:item.meaning || (skill.id==="vocab"?studentVocabularyMeaning(item.label):""),status:percent===null?"unrated":percent>=80?"mastered":percent>=60?"medium":"weak"};
+    }).sort((a,b)=>(a.percent??101)-(b.percent??101)||a.label.localeCompare(b.label));
+    const points=items.reduce((sum,item)=>sum+item.points,0);
+    const max=items.reduce((sum,item)=>sum+item.max,0);
+    const average=max>0?Math.round(points/max*100):null;
+    const learnedItems=Object.values(bucket.learnedMap||{}).sort((a,b)=>a.label.localeCompare(b.label));
+    return {...skill,items,learnedItems,points,max,average,mastered:items.filter(item=>item.status==="mastered").length,medium:items.filter(item=>item.status==="medium").length,weak:items.filter(item=>item.status==="weak").length,assessed:items.length};
+  });
+}
+function studentSkillStatusLabel(percent){
+  if(percent===null || percent===undefined)return "لم يتم التقييم بعد";
+  if(percent>=80)return "متقن";
+  if(percent>=60)return "متوسط";
+  return "يحتاج مراجعة";
+}
+function studentSkillOverviewMarkup(skillReport){
+  const cards=(skillReport||[]).map(skill=>{
+    const score=skill.average===null?"—":`${skill.average}%`;
+    const status=studentSkillStatusLabel(skill.average);
+    const tone=skill.average===null?"unrated":skill.average>=80?"mastered":skill.average>=60?"medium":"weak";
+    return `<button type="button" class="student-skill-preview-item ${tone}" data-action="student-results-open-skill" data-skill="${skill.id}">
+      <span class="student-skill-preview-icon">${skill.icon}</span>
+      <strong>${escapeHtml(skill.label)}</strong>
+      <b>${score}</b>
+      <small>${escapeHtml(status)}</small>
+      <em>${skill.assessed} عناصر مقيمة${skill.id==="vocab"&&skill.learnedItems?.length?` · ${skill.learnedItems.length} كلمة تعلمتها`:""}</em>
+    </button>`;
+  }).join("");
+  return `<section class="student-skills-preview-card">
+    <div class="student-skills-preview-head"><div><small>تحليل المهارات</small><h2>مستواك في الألمانية</h2><p>شوف شنو متقن وشنو خاصك تراجع في كل مهارة.</p></div><span>5</span></div>
+    <div class="student-skills-preview-grid">${cards}</div>
+    <button type="button" class="student-skills-open-all" data-action="student-results-jump" data-target="resultsSkills">عرض التحليل الكامل <span>←</span></button>
+  </section>`;
+}
+function studentSkillAnalyticsMarkup(skillReport,activeSkill="vocab"){
+  const current=(skillReport||[]).find(skill=>skill.id===activeSkill) || (skillReport||[])[0];
+  if(!current)return `<section class="admin-panel"><p class="admin-analytics-muted">لا توجد بيانات للعرض.</p></section>`;
+  const tabs=(skillReport||[]).map(skill=>`<button type="button" class="student-skill-tab ${skill.id===current.id?"active":""}" data-action="student-results-skill-select" data-skill="${skill.id}">
+    <span>${skill.icon}</span><strong>${escapeHtml(skill.label)}</strong><small>${skill.average===null?"—":skill.average+"%"}</small>
+  </button>`).join("");
+  const groups=[
+    {key:"mastered",label:"متقن",description:"نتائج 80% أو أكثر",tone:"mastered",icon:"✓",items:current.items.filter(item=>item.status==="mastered")},
+    {key:"medium",label:"متوسط",description:"نتائج من 60% إلى 79%",tone:"medium",icon:"◐",items:current.items.filter(item=>item.status==="medium")},
+    {key:"weak",label:"ضعيف",description:"نتائج أقل من 60%",tone:"weak",icon:"!",items:current.items.filter(item=>item.status==="weak")}
+  ];
+  const groupMarkup=groups.map(group=>`<section class="student-skill-group ${group.tone}">
+    <header><span class="student-skill-group-icon">${group.icon}</span><div><strong>${group.label}</strong><small>${group.description}</small></div><b>${group.items.length}</b></header>
+    ${group.items.length?`<div class="student-skill-items">${group.items.map(item=>`<article class="student-skill-item ${group.tone}">
+      <div class="student-skill-item-copy"><strong>${escapeHtml(item.label)}</strong>${item.meaning?`<small>${escapeHtml(item.meaning)}</small>`:""}<small class="student-skill-item-meta">${item.lessonIndex>=0?`L${item.lessonIndex+1} · `:""}${item.attempts} محاولة · ${item.points}/${item.max}</small></div>
+      <div class="student-skill-item-score"><b>${item.percent}%</b><span>${escapeHtml(studentSkillStatusLabel(item.percent))}</span></div>
+    </article>`).join("")}</div>`:`<p class="student-skill-group-empty">ما كاين حتى عنصر فهاد التصنيف حالياً.</p>`}
+  </section>`).join("");
+  const note=current.id==="speaking"?`<p class="student-skill-note">المؤشر الحالي كيقيس تمارين الحوار المسجّلة. تقييم النطق الصوتي الحقيقي يحتاج تمريناً يسجّل صوت المتعلم ويصححه.</p>`:
+    current.id==="listening"?`<p class="student-skill-note">كيتم الحساب غير من تمارين الاستماع اللي عندها نتيجة محفوظة، وما كيتحسبش مجرد تشغيل الصوت.</p>`:
+    current.id==="vocab"?`<p class="student-skill-note">الكلمات اللي ضغطتي عليها داخل الدروس كتظهر في «كلمات تعلمتها». النسبة والتصنيف كيتحسبو غير للكلمات اللي تقيّمات باختبار.</p>`:
+    `<p class="student-skill-note">الحساب مبني على نتائج التمارين المصححة والمحاولات المحفوظة، وما كيتحسب حتى عنصر ما تمش تقييمه.</p>`;
+  const learnedMarkup=current.id==="vocab"&&current.learnedItems?.length?`<section class="student-skill-group learned">
+    <header><span class="student-skill-group-icon">📖</span><div><strong>الكلمات اللي تعلمتيها داخل الدروس</strong><small>تسجلات ملي ضغطتي على الكلمة وشفتِ معناها أو نطقها</small></div><b>${current.learnedItems.length}</b></header>
+    <div class="student-skill-items">${current.learnedItems.map(item=>`<article class="student-skill-item learned">
+      <div class="student-skill-item-copy"><strong dir="auto">${escapeHtml(item.label)}</strong>${item.meaning?`<small dir="auto">${escapeHtml(item.meaning)}</small>`:""}<small class="student-skill-item-meta">${item.level&&item.level!=="A1"?`${escapeHtml(item.level)} · `:""}${item.lessonIndex>=0?`L${item.lessonIndex+1} · `:""}${item.learnedAt?`آخر تفاعل ${escapeHtml(new Date(item.learnedAt).toLocaleDateString("ar"))}`:"تم التعرف عليها داخل الدرس"}</small></div>
+      <div class="student-skill-item-score"><b>✓</b><span>تعلمتها</span></div>
+    </article>`).join("")}</div>
+  </section>`:"";
+  const hasLearned=current.id==="vocab"&&current.learnedItems?.length>0;
+  const empty=current.assessed===0&&!hasLearned?`<div class="student-skill-empty"><span>${current.icon}</span><strong>مازال ما كايناش نتائج مسجلة فهاد المهارة</strong><p>منين تكمل تمرين مصحح مرتبط بهاد المهارة، غادي يبان التحليل هنا.</p></div>`:"";
+  return `<section class="student-skills-analysis">
+    <nav class="student-skill-tabs" aria-label="المهارات">${tabs}</nav>
+    <section class="student-skill-detail-card">
+      <div class="student-skill-detail-head"><div><small>${escapeHtml(current.de)}</small><h2>${escapeHtml(current.label)}</h2><p>${escapeHtml(current.description)}</p></div><div class="student-skill-main-score"><b>${current.average===null?"—":current.average+"%"}</b><small>${escapeHtml(studentSkillStatusLabel(current.average))}</small></div></div>
+      ${current.assessed?`<div class="student-skill-progress-track"><i style="width:${current.average}%"></i></div>
+      <div class="student-skill-counts"><div><b>${current.mastered}</b><span>متقن</span></div><div><b>${current.medium}</b><span>متوسط</span></div><div><b>${current.weak}</b><span>ضعيف</span></div></div>`:""}
+      ${note}
+    </section>
+    ${empty || `${current.assessed?`<div class="student-skill-groups">${groupMarkup}</div>`:""}${learnedMarkup}`}
+  </section>`;
+}
+
 function studentResultsTrendPoints(results){
   return (results||[])
     .filter(result=>adminResultType(result)==="test" || adminResultPercent(result)!==null)
@@ -5151,6 +5550,7 @@ function renderStudentResults(){
     ? allResults
     : allResults.filter(result=>adminResultLessonIndex(result)===Number(selectedLesson)-1);
   const testResults=results.filter(result=>adminResultType(result)==="test");
+  const skillReport=studentBuildSkillReport(results);
   const report=adminStudentAnalytics(currentUser,{lesson:selectedLesson,type:"test"});
   const timeReport=adminStudentAnalytics(currentUser,{lesson:selectedLesson,type:"all"});
   const averageValue=report && report.average!==null ? Number(report.average) : null;
@@ -5201,6 +5601,7 @@ function renderStudentResults(){
   const shortcuts=[
     {icon:"◴",tone:"green",label:"استعدادك للامتحان",target:"resultsExamReadiness"},
     {icon:"◎",tone:"pink",label:"نقاط الضعف",target:"resultsWeakPoints"},
+    {icon:"📊",tone:"blue",label:"تحليل المهارات",target:"resultsSkills"},
     {icon:"↻",tone:"violet",label:"مراجعة الكلمات",action:"student-nav",tab:"learn"},
     {icon:"☆",tone:"orange",label:"المحفوظات",action:"student-nav",tab:"learn"},
     {icon:"♙",tone:"purple",label:"شهاداتي",target:"resultsAchievements"},
@@ -5234,6 +5635,7 @@ function renderStudentResults(){
       <article class="progress-metric-card"><span>📚</span><strong>${completedLessons}/${selectedLesson==="all"?lessons.length:1}</strong><small>دروس تم تقييمها</small></article>
       <article class="progress-metric-card"><span>⏱</span><strong>${escapeHtml(totalTime)}</strong><small>وقت التعلم</small></article>
     </section>
+    ${studentSkillOverviewMarkup(skillReport)}
     <section class="progress-shortcuts-card">
       <div class="progress-shortcuts-head"><div><small>مساحتك التعليمية</small><h2>أدوات النتائج</h2></div><span class="progress-shortcuts-count">${weakCount} نقطة للمراجعة</span></div>
       <div class="progress-shortcuts-grid">${shortcutMarkup}</div>
@@ -5273,7 +5675,8 @@ function renderStudentResults(){
     resultsStages:stageDetail || `<section class="admin-panel"><div class="admin-section-head"><div><p class="admin-eyebrow">المراحل والتمارين</p><h2>تحليل المراحل</h2></div></div><p class="admin-analytics-muted">لا توجد تفاصيل مراحل محفوظة لهذا الاختيار بعد.</p></section>`,
     resultsExercises:heatmap || `<section class="admin-panel"><div class="admin-section-head"><div><p class="admin-eyebrow">أداء التمارين</p><h2>تفاصيل التمارين</h2></div></div><p class="admin-analytics-muted">لا توجد تفاصيل تمارين محفوظة لهذا الاختيار بعد.</p></section>`,
     resultsCourseProgress:courseProgressMarkup,
-    resultsLessonProgress:lessonProgressMarkup
+    resultsLessonProgress:lessonProgressMarkup,
+    resultsSkills:studentSkillAnalyticsMarkup(skillReport,studentResultsActiveSkill)
   };
   const resultToolTitles={
     resultsExamReadiness:"استعدادك للامتحان",
@@ -5284,7 +5687,8 @@ function renderStudentResults(){
     resultsStages:"تحليل المراحل",
     resultsExercises:"تفاصيل التمارين",
     resultsCourseProgress:"إنجاز التمارين",
-    resultsLessonProgress:"تقدم الدروس"
+    resultsLessonProgress:"تقدم الدروس",
+    resultsSkills:"تحليل مهارات اللغة"
   };
   const activeToolMarkup=resultToolViews[studentResultsActiveTool]||"";
   const activeToolTitle=resultToolTitles[studentResultsActiveTool]||"";
@@ -5554,13 +5958,13 @@ function loadManagedPageIntoFrame(frame,path){
         // Cursor-only legacy progress doesn't contain any quiz scores.
         saveCourseProgress(level,no,{legacyUnscoredStages:Number(saved.lastTab)},false);
       }
-      sessionStorage.setItem("deutsch_course_launch_v7:"+address.pathname,JSON.stringify({
-        version:7,mode:courseResumeMode,level,no,student:String(currentUser.id),
+      sessionStorage.setItem("deutsch_course_launch_v8:"+address.pathname,JSON.stringify({
+        version:8,mode:courseResumeMode,level,no,student:String(currentUser.id),
         saved,issuedAt:Date.now()
       }));
       // Cache-bust the HTML too, not just index/app.js. Otherwise a browser
       // can still execute an older stage-1-only course file.
-      address.searchParams.set("deutsch-resume-v","7");
+      address.searchParams.set("deutsch-resume-v","8_20261118");
       targetUrl=address.href;
     }catch(error){console.warn("Could not share course bootstrap",error);}
   }
@@ -6678,6 +7082,7 @@ function bindTestCenterFrameMessages(){
       currentCategory = String(message.category || "");
       testIndex = 0; testScore = 0; testChoice = null; testAnswered = false;
       testQuestionScores = {}; testQuestionLabels = {};
+      testAttemptId = createStudentAttemptId();
       testReturnPage = "test-categories";
       page = "test";
     }else if(action === "open-standalone-lesson-test"){
@@ -6706,6 +7111,7 @@ function bindTestCenterFrameMessages(){
     }else if(action === "retry-test"){
       testIndex = 0; testScore = 0; testChoice = null; testAnswered = false;
       testQuestionScores = {}; testQuestionLabels = {};
+      testAttemptId = createStudentAttemptId();
       page = "test";
     }else if(action === "test-home"){
       page = testReturnPage || "test-categories";
@@ -6831,6 +7237,7 @@ function renderInteractiveLessonPoster(){
         }
       }catch(e){}
     },{once:true});
+    trackStandaloneVocabularyFrame(frame,"A1",lessonNumber());
     loadManagedPageIntoFrame(frame, poster.file);
   }
 }
@@ -6870,6 +7277,7 @@ function renderNumbers(){
         }
       } catch(e) {}
     });
+    trackStandaloneVocabularyFrame(frame,"A1",1);
     loadManagedPageIntoFrame(frame, "pages/numbers.html");
   }
 }
@@ -6908,6 +7316,7 @@ function renderEssen(){
         }
       } catch(e) {}
     });
+    trackStandaloneVocabularyFrame(frame,"A1",3);
     loadManagedPageIntoFrame(frame, "pages/essen.html");
   }
 }
@@ -6950,6 +7359,7 @@ function renderStadtWohnung(){
         if(image && !image.complete) image.addEventListener("load", updateHeight, {once:true});
       } catch(e) {}
     });
+    trackStandaloneVocabularyFrame(frame,"A1",6);
     loadManagedPageIntoFrame(frame, "pages/meine-stadt.html");
   }
 }
@@ -6988,6 +7398,7 @@ function renderFreizeit(){
         }
       } catch(e) {}
     });
+    trackStandaloneVocabularyFrame(frame,"A1",5);
     loadManagedPageIntoFrame(frame, "pages/freizeit.html");
   }
 }
@@ -7021,6 +7432,7 @@ function renderFamilyTree(){
         }
       } catch(e) {}
     });
+    trackStandaloneVocabularyFrame(frame,"A1",2);
     loadManagedPageIntoFrame(frame, "pages/family-tree.html");
   }
 }
@@ -7204,6 +7616,7 @@ function renderLearning(){
         ${renderWordArt(it)}<h3>${escapeHtml(it[0])}</h3><p class="arabic">${escapeHtml(it[1])}</p>
       </button>` : `${renderWordArt(it)}<h3>${escapeHtml(it[0])}</h3><p class="arabic">${escapeHtml(it[1])}</p>`}
       <div class="example"><strong>Beispiel</strong>${escapeHtml(it[2])}</div>
+      <button type="button" class="word-learned-btn" data-action="student-learn-word" data-word-index="${i}">✓ تعلمت هذه الكلمة</button>
     </article>`).join("")}</div>${renderVerbModal()}`;
   }else if(learningTab==="Texte"){
     body = `<div class="text-list">${all.map((it,i)=>`<article class="text-card">
@@ -7259,7 +7672,9 @@ function renderResult(){
   saveStudentResult(`lektion-${lessonNumber()}-${slugify(currentCategory)}`,`${lessonData().name} · ${currentCategory}`,testScore,total,{
     completedExercises:Object.keys(questionScores).length,totalExercises:total,
     scores:questionScores,completed:questionCompleted,exerciseLabels:questionLabels,
-    stageByExercise:questionStages,stageLabels:questionStageLabels,contentType:"test"
+    stageByExercise:questionStages,stageLabels:questionStageLabels,
+    skillType:currentCategory==="Grammatik"?"sentences":"vocab",
+    attemptId:testAttemptId || createStudentAttemptId(),contentType:"test"
   });
   renderTestCenterFrame(
     "result",
@@ -7289,6 +7704,7 @@ function render(){
   if(page==="community") return renderCommunity();
   if(page==="competition") return renderCompetition();
   if(page==="settings") return renderSettings();
+  if(page==="settings-detail") return renderSettingsDetail();
   if(page==="home") return renderHome();
   if(page==="levels") return renderLevels();
   if(page==="level-home") return renderLevelHome();
@@ -7322,7 +7738,8 @@ function render(){
 function back(){
   if(page==="admin-managed-html"){page="admin";return render();}
   if(page==="community" && communityRoom){communityRoom=null;return render();}
-  if(page==="student-results") page="home";
+  if(page==="settings-detail"){page="settings";settingsActivePanel="account";}
+  else if(page==="student-results") page="home";
   else if(page==="talk"){
     page=talkReturnPage||"home";
     if(page==="lesson-hub") currentLesson=talkReturnLesson;
@@ -7401,6 +7818,7 @@ if(podcastWordOverlay) podcastWordOverlay.addEventListener("click",function(even
 });
 document.addEventListener("keydown",function(event){
   if(event.key === "Escape"){
+    if(page==="settings-detail"){page="settings";settingsActivePanel="account";render();return;}
     if(document.getElementById("courseResumeDialog")){pendingCourseLaunch=null;closeCourseResumeDialog();}
     closePodcastWordPopup();
     closeAdminStudentDetails();
@@ -7424,6 +7842,16 @@ window.addEventListener("message",function(event){
 document.addEventListener("change",function(event){
   const target=event.target;
   if(!target)return;
+  if(target.id==="settingsUiLanguage" || target.id==="settingsTranslationLanguage"){
+    const prefs=readSettingsLanguages();
+    if(!SETTINGS_LANGUAGES[target.value])return;
+    if(target.id==="settingsUiLanguage")prefs.ui=target.value;
+    else prefs.translation=target.value;
+    saveSettingsLanguages(prefs);
+    renderSettingsDetail();
+    showToast(settingsStrings().langSaved);
+    return;
+  }
   if(target.id==="adminPageImportFile"){
     const file = target.files && target.files[0];
     target.value = "";
@@ -7489,7 +7917,7 @@ window.addEventListener("message",function(event){
   if(!sameOrigin && !fromOwnedTestFrame && !fromCustomContentFrame) return;
   const data=event.data;
   if(!data || typeof data!=="object") return;
-  if(data.type==="deutsch-course-native-state-v7" &&
+  if(["deutsch-course-native-state-v8","deutsch-course-native-state-v7"].includes(data.type) &&
      activeCourseFrame?.frame?.contentWindow===event.source && sameOrigin){
     const {level,no}=activeCourseFrame;
     if(activeCourseFrame.initializing || data.level!==level || Number(data.lessonNumber)!==Number(no))return;
@@ -7499,7 +7927,8 @@ window.addEventListener("message",function(event){
     const native=readNativeCourseState(activeCourseFrame.frame.contentWindow);
     if(native && native.current!==Number(state.lastTab))return;
     const previous=getCourseProgress(level,no)||{};
-    const updates={nativeResumeVersion:7,lastTab:Number(state.lastTab),nativeStages:state.nativeStages,
+    const updates={nativeResumeVersion:Number(state.nativeResumeVersion)||8,lastTab:Number(state.lastTab),nativeStages:state.nativeStages,
+      nativeNavigationAt:state.nativeNavigationAt||new Date().toISOString(),navigationAt:state.navigationAt||new Date().toISOString(),
       nativeQuiz:state.nativeQuiz||null,completed:state.completed===true,
       totalTabs:Number(state.totalTabs)||previous.totalTabs||0,
       scrollTop:Number(state.scrollTop)||0};
@@ -7611,6 +8040,16 @@ document.addEventListener("click",function(event){
   const el=event.target.closest("[data-action]");
   if(!el)return;
   const action=el.dataset.action;
+  if(action==="settings-open-panel"){
+    const section=el.dataset.panel;
+    if(["account","learning","display"].includes(section)){
+      settingsActivePanel=section;page="settings-detail";render();
+    }
+    return;
+  }
+  if(action==="settings-back"){
+    settingsActivePanel="account";page="settings";render();return;
+  }
   if(action==="course-resume"){launchPendingCourse("resume");return;}
   if(action==="course-restart"){launchPendingCourse("restart");return;}
   if(action==="course-resume-cancel"){pendingCourseLaunch=null;closeCourseResumeDialog();return;}
@@ -7946,11 +8385,22 @@ document.addEventListener("click",function(event){
   if(action==="admin-open-group"){adminSelectedGroupId=el.dataset.id||null;adminSection="groups";render();return;}
   if(action==="login-submit"){loginFromForm();return;}
   else if(action==="logout"){logout();return;}
-  else if(action==="student-results"){page="student-results";studentResultsExpanded=false;studentResultsActiveTool="";render();return;}
+  else if(action==="student-results"){page="student-results";studentResultsExpanded=false;studentResultsActiveTool="";studentResultsActiveSkill="vocab";render();return;}
   else if(action==="student-results-toggle"){studentResultsExpanded=!studentResultsExpanded;render();if(studentResultsExpanded){const panel=document.getElementById("studentResultsDetails");if(panel)panel.scrollIntoView({behavior:"smooth",block:"start"});}return;}
   else if(action==="student-results-jump"){
     const targetId=el.dataset.target||"";
     if(targetId){studentResultsActiveTool=targetId;render();}
+    return;
+  }
+  else if(action==="student-results-open-skill"){
+    studentResultsActiveSkill=el.dataset.skill||"vocab";
+    studentResultsActiveTool="resultsSkills";
+    render();
+    return;
+  }
+  else if(action==="student-results-skill-select"){
+    studentResultsActiveSkill=el.dataset.skill||"vocab";
+    render();
     return;
   }
   else if(action==="student-results-tool-back"){
@@ -8071,7 +8521,7 @@ document.addEventListener("click",function(event){
   else if(action==="podcast-show-all"){podcastFilterLesson=null;activePodcastSelection=null;activePodcastFile=null;activePodcastLoading=false;activePodcastError="";render();return;}
   else if(action==="podcast-file-open"){currentPodcastId=el.dataset.podcastId||"";podcastFilterLesson=null;selectPodcast("builtin",currentPodcastId);return;}
   else if(action==="test-lesson-open"){const idx=Number(el.dataset.lesson);if(!getStudentLessonAccess(idx)){showToast("Diese Lektion wurde vom Administrator gesperrt.");return;}currentLesson=idx;openLessonTestEntry("tests");}
-  else if(action==="category-test"){currentCategory=el.dataset.category;testIndex=0;testScore=0;testChoice=null;testAnswered=false;testQuestionScores={};testQuestionLabels={};testReturnPage="test-categories";page="test";}
+  else if(action==="category-test"){currentCategory=el.dataset.category;testIndex=0;testScore=0;testChoice=null;testAnswered=false;testQuestionScores={};testQuestionLabels={};testAttemptId=createStudentAttemptId();testReturnPage="test-categories";page="test";}
   else if(action==="open-standalone-lesson-test"){page="standalone-lesson-test";}
   else if(action==="close-standalone-lesson-test"){document.documentElement.classList.remove("challenge-fullscreen-open");document.body.classList.remove("challenge-fullscreen-open");page=testCategoriesReturnPage||"tests";render();return;}
   else if(action==="close-lesson-section-page"){saveActiveCourseBeforeExit();document.documentElement.classList.remove("challenge-fullscreen-open");document.body.classList.remove("challenge-fullscreen-open");page=lessonSectionReturnPage||"lesson-hub";render();return;}
@@ -8124,7 +8574,15 @@ document.addEventListener("click",function(event){
   else if(action==="verb-card"){
     if(currentCategory!=="Verben")return;
     const idx=Number(el.dataset.verbIndex);
+    const word=items()[idx];
+    if(word)recordStudentLearnedWord("A1",lessonNumber(),word[0],word[1],"learning-card");
     activeVerbCard = activeVerbCard===idx ? null : idx;
+  }
+  else if(action==="student-learn-word"){
+    const idx=Number(el.dataset.wordIndex);
+    const word=items()[idx];
+    if(word){recordStudentLearnedWord("A1",lessonNumber(),word[0],word[1],"learning-card");showToast(`تسجلات الكلمة «${word[0]}» في نتائج الدرس.`);}
+    return;
   }
   else if(action==="speak-verb"){
     const idx=Number(el.dataset.verbIndex);
@@ -8136,8 +8594,13 @@ document.addEventListener("click",function(event){
     if(items()[idx]) speakOneVerbForm(items()[idx],formIndex);
     return;
   }
-  else if(action==="speak"){speak(el.dataset.text||"");return;}
-  else if(action==="start-test"){testIndex=0;testScore=0;testChoice=null;testAnswered=false;testQuestionScores={};testQuestionLabels={};testReturnPage="category";page="test";}
+  else if(action==="speak"){
+    const spoken=String(el.dataset.text||"");
+    const matchingWord=items().find(item=>String(item[2]||"").trim()===spoken.trim());
+    if(matchingWord)recordStudentLearnedWord("A1",lessonNumber(),matchingWord[0],matchingWord[1],"learning-audio");
+    speak(spoken);return;
+  }
+  else if(action==="start-test"){testIndex=0;testScore=0;testChoice=null;testAnswered=false;testQuestionScores={};testQuestionLabels={};testAttemptId=createStudentAttemptId();testReturnPage="category";page="test";}
   else if(action==="choice"){if(!testAnswered){testChoice=Number(el.dataset.choice);}}
   else if(action==="check-answer"){
     if(testChoice!==null&&!testAnswered){
@@ -8151,7 +8614,7 @@ document.addEventListener("click",function(event){
     }
   }
   else if(action==="next-question"){if(testIndex<items().length-1){testIndex++;testChoice=null;testAnswered=false;}else{page="test-result";}}
-  else if(action==="retry-test"){testIndex=0;testScore=0;testChoice=null;testAnswered=false;testQuestionScores={};testQuestionLabels={};page="test";}
+  else if(action==="retry-test"){testIndex=0;testScore=0;testChoice=null;testAnswered=false;testQuestionScores={};testQuestionLabels={};testAttemptId=createStudentAttemptId();page="test";}
   else if(action==="category-home"){page="category";}
   else if(action==="test-home"){page=testReturnPage;}
   render();
@@ -8172,8 +8635,10 @@ if(app && window.MutationObserver){
 }
 window.addEventListener("storage",function(event){
   if(event.key===UI_DISPLAY_PREFERENCES_KEY)applyUiDisplayPreferences();
+  if(event.key===settingsPrefStorageKey() && (page==="settings" || page==="settings-detail"))render();
 });
 window.addEventListener("resize",refreshUiTextBaselines);
+document.addEventListener("load",event=>{if(event.target?.tagName==="IFRAME")broadcastSettingsTranslationLanguage();},true);
 
 function startDemoSession(){
   demoMode=true;
